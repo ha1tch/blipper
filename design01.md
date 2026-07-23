@@ -10,6 +10,19 @@
 **Primary Compatibility Target:** dBASE III+ / Nantucket Clipper 5.x
 **Status:** Design Specification
 
+> **Reconciliation — 2026-07-23 (v0.1.0).** Implemented as specified,
+> with the following deviations. (a) §5.3: `readHeader` additionally
+> returns the on-disk header and record sizes, and `writeHeader` takes
+> explicit sizes instead of a `Schema`; root cause is DBF files with
+> padded headers, which must survive open and header rewrite without
+> corruption. (b) §10: the NTX package additionally carries `keys.go`
+> (key encoding helpers and `Build`) and `query.go` (point queries
+> `Min`/`Max`/`FirstGE`/`Successor`/`Predecessor` used for record
+> pointer navigation); `create`/`open` live in `tree.go`. (c) Beyond
+> this document's scope, the repository gained the `blipperdb`
+> package (design03.md). Register items: T-04, T-05. Content below
+> this banner is historical and unedited.
+
 ---
 
 # 1. Purpose

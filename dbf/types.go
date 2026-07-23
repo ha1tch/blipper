@@ -77,6 +77,8 @@ type Table struct {
 
 // Cursor provides sequential access to records in a Table.
 type Cursor struct {
-	table *Table
-	recno uint32
+	table   *Table
+	recno   uint32
+	current Record
+	err     error
 }

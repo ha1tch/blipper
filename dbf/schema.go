@@ -93,10 +93,10 @@ func (s *Schema) RecordSize() uint16 {
 	size := 1 // deletion marker
 
 	for _, f := range s.Fields {
-		size += uint16(f.Length)
+		size += int(f.Length)
 	}
 
-	return size
+	return uint16(size)
 }
 
 // HeaderSize returns the size of the DBF header.

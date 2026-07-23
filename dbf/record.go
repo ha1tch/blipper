@@ -8,12 +8,12 @@ import (
 
 // NewRecord creates an empty record initialized according to the schema.
 //
-// Values are initialized with the zero value appropriate for each field type.
+// Values are initialized with the zero value appropriate for each field.
 func NewRecord(schema Schema) Record {
 	values := make([]any, len(schema.Fields))
 
 	for i, field := range schema.Fields {
-		values[i] = zeroValue(field.Type)
+		values[i] = zeroValue(field)
 	}
 
 	return Record{
@@ -24,13 +24,13 @@ func NewRecord(schema Schema) Record {
 // Get returns the value of a field by name.
 //
 // Field names are matched case-insensitively.
-func (r Record) Get(name string) (any, error) {
-	index, err := fieldIndex(r, name)
+func (r Record) Get(schema Schema, name string) (any, error) {
+	index, err := schemaFieldIndex(schema, name)
 	if err != nil {
 		return nil, err
 	}
 
-	return r.Values[index], nil
+	return r.GetIndex(index)
 }
 
 // Set updates a field value by name.
@@ -89,21 +89,18 @@ func schemaFieldIndex(schema Schema, name string) (int, error) {
 	return -1, fmt.Errorf("field %q not found", name)
 }
 
-func fieldIndex(r Record, name string) (int, error) {
-	// A record does not carry its schema.
-	//
-	// This helper exists temporarily for symmetry with Get.
-	// Get will be replaced by schema-aware access once records are
-	// consistently associated with schemas through table operations.
-	return -1, fmt.Errorf("field lookup requires schema for %q", name)
-}
-
-func zeroValue(t FieldType) any {
-	switch t {
+func zeroValue(f Field) any {
+	switch f.Type {
 	case Character:
 		return ""
 
-	case Numeric, Float:
+	case Numeric:
+		if f.Decimals == 0 {
+			return int64(0)
+		}
+		return float64(0)
+
+	case Float:
 		return float64(0)
 
 	case Logical:

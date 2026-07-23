@@ -16,19 +16,29 @@ const (
 	dbfVersion = 0x03 // dBASE III+
 )
 
+// headerInfo carries the physical bookkeeping read from a DBF header.
+//
+// These values belong to the implementation and never surface in the
+// public API.
+type headerInfo struct {
+	recordCount uint32
+	headerSize  uint16
+	recordSize  uint16
+}
+
 // readHeader reads the 32-byte DBF file header.
 //
-// It returns the logical header metadata together with the current
-// record count stored in the file.
-func readHeader(r io.Reader) (Header, uint32, error) {
+// It returns the logical header metadata together with the physical
+// bookkeeping stored in the file.
+func readHeader(r io.Reader) (Header, headerInfo, error) {
 	var raw [fileHeaderSize]byte
 
 	if _, err := io.ReadFull(r, raw[:]); err != nil {
-		return Header{}, 0, err
+		return Header{}, headerInfo{}, err
 	}
 
 	if raw[0] != dbfVersion {
-		return Header{}, 0,
+		return Header{}, headerInfo{},
 			fmt.Errorf("unsupported DBF version 0x%02X", raw[0])
 	}
 
@@ -41,16 +51,25 @@ func readHeader(r io.Reader) (Header, uint32, error) {
 		CodePage: raw[29],
 	}
 
-	recordCount := binary.LittleEndian.Uint32(raw[4:8])
+	info := headerInfo{
+		recordCount: binary.LittleEndian.Uint32(raw[4:8]),
+		headerSize:  binary.LittleEndian.Uint16(raw[8:10]),
+		recordSize:  binary.LittleEndian.Uint16(raw[10:12]),
+	}
 
-	return header, recordCount, nil
+	return header, info, nil
 }
 
 // writeHeader writes the 32-byte DBF file header.
+//
+// headerSize and recordSize are passed explicitly rather than being
+// recomputed from a schema: a file opened with a padded header keeps
+// its original header size when the header is rewritten.
 func writeHeader(
 	w io.Writer,
 	header Header,
-	schema Schema,
+	headerSize uint16,
+	recordSize uint16,
 	recordCount uint32,
 ) error {
 
@@ -67,12 +86,12 @@ func writeHeader(
 
 	binary.LittleEndian.PutUint16(
 		raw[8:10],
-		schema.HeaderSize(),
+		headerSize,
 	)
 
 	binary.LittleEndian.PutUint16(
 		raw[10:12],
-		schema.RecordSize(),
+		recordSize,
 	)
 
 	// bytes 12..13
