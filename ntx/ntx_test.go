@@ -3,8 +3,10 @@ package ntx
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"sort"
 	"testing"
@@ -596,11 +598,15 @@ func TestKeyHelpers(t *testing.T) {
 		t.Errorf("LogicalKey = %q", got)
 	}
 
+	// Clipper zero pads numeric keys. A leading space would collate
+	// below every digit and break the ordering, so this is not a
+	// cosmetic difference from a DBF record field, which does space
+	// pad. Byte values below are taken from Clipper 5.2e output.
 	key, err := NumericKey(42, 6, 0)
 	if err != nil {
 		t.Fatalf("NumericKey: %v", err)
 	}
-	if string(key) != "    42" {
+	if string(key) != "000042" {
 		t.Errorf("NumericKey = %q", string(key))
 	}
 
@@ -608,7 +614,7 @@ func TestKeyHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NumericKey: %v", err)
 	}
-	if string(key) != "  3.50" {
+	if string(key) != "003.50" {
 		t.Errorf("NumericKey decimals = %q", string(key))
 	}
 
@@ -619,11 +625,82 @@ func TestKeyHelpers(t *testing.T) {
 		t.Errorf("NumericKey collation broken: %q >= %q", nine, ten)
 	}
 
-	if _, err := NumericKey(-1, 6, 0); err == nil {
-		t.Errorf("NumericKey accepted a negative value (T-01)")
-	}
-
 	if _, err := NumericKey(1234567, 4, 0); err == nil {
 		t.Errorf("NumericKey accepted an overflowing value")
+	}
+}
+
+// Byte-for-byte assertions against keys written by Clipper 5.2e under
+// guard G-01. See docs/CLIPPER_ORACLE.md §9 for the derivation and the
+// generating program. Register item T-01.
+func TestNumericKeyMatchesClipperOutput(t *testing.T) {
+	cases := []struct {
+		value    float64
+		expected string
+	}{
+		// From TNUM.NTX, an 8-byte key with 2 decimals.
+		{-25.50, "2c2c2c2a272e272c"},
+		{-1.00, "2c2c2c2c2b2e2c2c"},
+		{0.00, "30303030302e3030"},
+		{7.25, "30303030372e3235"},
+		{1234.56, "30313233342e3536"},
+
+		// From VNUM.NTX and MNUM.NTX, independently generated.
+		{-99.99, "2c2c2c23232e2323"},
+		{42.00, "30303034322e3030"},
+		{-7.50, "2c2c2c2c252e272c"},
+		{300.10, "30303330302e3130"},
+	}
+
+	for _, c := range cases {
+		key, err := NumericKey(c.value, 8, 2)
+		if err != nil {
+			t.Fatalf("NumericKey(%v): %v", c.value, err)
+		}
+
+		if got := hex.EncodeToString(key); got != c.expected {
+			t.Errorf("NumericKey(%v) = %s, Clipper wrote %s",
+				c.value, got, c.expected)
+		}
+	}
+}
+
+// Negative keys must sort below positives, and larger magnitudes
+// first, which is the whole purpose of the transform.
+func TestNumericKeyNegativeCollation(t *testing.T) {
+	ordered := []float64{-1234.56, -99.99, -25.50, -7.50, -1.00, 0.00, 1.00, 7.25, 300.10, 1234.56}
+
+	keys := make([][]byte, len(ordered))
+	for i, v := range ordered {
+		k, err := NumericKey(v, 8, 2)
+		if err != nil {
+			t.Fatalf("NumericKey(%v): %v", v, err)
+		}
+		keys[i] = k
+	}
+
+	for i := 1; i < len(keys); i++ {
+		if bytes.Compare(keys[i-1], keys[i]) >= 0 {
+			t.Errorf("collation broken: %v (%q) >= %v (%q)",
+				ordered[i-1], keys[i-1], ordered[i], keys[i])
+		}
+	}
+}
+
+// Negative zero is not negative: it must encode exactly as zero, or a
+// value that compares equal would sort at the far end of the index.
+func TestNumericKeyNegativeZero(t *testing.T) {
+	zero, err := NumericKey(0, 8, 2)
+	if err != nil {
+		t.Fatalf("NumericKey(0): %v", err)
+	}
+
+	negZero, err := NumericKey(math.Copysign(0, -1), 8, 2)
+	if err != nil {
+		t.Fatalf("NumericKey(-0): %v", err)
+	}
+
+	if !bytes.Equal(zero, negZero) {
+		t.Errorf("negative zero encoded as %q, want %q", negZero, zero)
 	}
 }

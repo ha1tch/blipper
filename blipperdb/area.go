@@ -28,6 +28,26 @@ type Area struct {
 	recno uint32
 	atEOF bool
 	atBOF bool
+
+	// cdx, when non-nil, is the compound-index attachment. See
+	// blipperdb/cdx_area.go for the API.
+	cdx *AttachedCDX
+
+	// memo, when non-nil, is the attached memo file (DBT or
+	// FPT). See blipperdb/memo_area.go for the API.
+	memo *AttachedMemo
+
+	// catalogue, when non-nil, is the attached .DBC (long-name
+	// catalogue). See blipperdb/catalogue_area.go for the API.
+	catalogue *AttachedCatalogue
+
+	// mode selects exclusive or shared access. Zero value is
+	// Exclusive, so an area opened through Use behaves exactly
+	// as it did before locking existed.
+	mode OpenMode
+
+	// held records the lock this area currently holds, if any.
+	held *heldLock
 }
 
 // attachedIndex pairs an open index with the key function that
@@ -382,6 +402,11 @@ func (a *Area) Seek(key []byte) (bool, error) {
 // every attached index, and moves the pointer to it, mirroring
 // APPEND.
 func (a *Area) Append(record dbf.Record) (uint32, error) {
+	// Appending changes the record count, so in shared mode it
+	// needs a lock covering the file rather than any one record.
+	if err := a.checkWritable(0); err != nil {
+		return 0, err
+	}
 	recno, err := a.table.Append(record)
 	if err != nil {
 		return 0, err
@@ -410,6 +435,9 @@ func (a *Area) Append(record dbf.Record) (uint32, error) {
 func (a *Area) Replace(record dbf.Record) error {
 	if a.recno == 0 {
 		return fmt.Errorf("%s: no current record", a.alias)
+	}
+	if err := a.checkWritable(a.recno); err != nil {
+		return err
 	}
 
 	old, err := a.table.Get(a.recno)
@@ -459,6 +487,9 @@ func (a *Area) Delete() error {
 	if a.recno == 0 {
 		return fmt.Errorf("%s: no current record", a.alias)
 	}
+	if err := a.checkWritable(a.recno); err != nil {
+		return err
+	}
 
 	return a.table.Delete(a.recno)
 }
@@ -468,6 +499,9 @@ func (a *Area) Delete() error {
 func (a *Area) Recall() error {
 	if a.recno == 0 {
 		return fmt.Errorf("%s: no current record", a.alias)
+	}
+	if err := a.checkWritable(a.recno); err != nil {
+		return err
 	}
 
 	return a.table.Undelete(a.recno)
@@ -499,6 +533,29 @@ func (a *Area) close() error {
 	}
 
 	a.indexes = nil
+
+	// Attachments added after the original NTX-only design keep
+	// their own handles; each must be released too, or a session
+	// over a directory of memo-bearing tables leaks a descriptor
+	// per table.
+	if a.memo != nil {
+		if err := closeIfCloser(a.memo.src); err != nil && first == nil {
+			first = err
+		}
+		a.memo = nil
+	}
+	if a.cdx != nil {
+		if err := closeIfCloser(a.cdx.src); err != nil && first == nil {
+			first = err
+		}
+		a.cdx = nil
+	}
+	if a.catalogue != nil {
+		if err := closeIfCloser(a.catalogue.src); err != nil && first == nil {
+			first = err
+		}
+		a.catalogue = nil
+	}
 
 	if err := closeIfCloser(a.src); err != nil && first == nil {
 		first = err

@@ -9,11 +9,15 @@ import (
 const fieldDescriptorSize = 32
 
 // readFields reads all field descriptors until the header terminator (0x0D).
-func readFields(r io.Reader) ([]Field, error) {
+//
+// lineageIsDBase selects how the on-disk B and G type bytes are
+// interpreted — see dbf/dbasetypes.go and dbf/header.go's
+// isDBaseLineage.
+func readFields(r io.Reader, lineageIsDBase bool) ([]Field, error) {
 	fields := make([]Field, 0, 16)
 
 	for {
-		field, done, err := readField(r)
+		field, done, err := readField(r, lineageIsDBase)
 		if err != nil {
 			return nil, err
 		}
@@ -25,6 +29,14 @@ func readFields(r io.Reader) ([]Field, error) {
 }
 
 // writeFields writes all field descriptors followed by the header terminator.
+//
+// Unlike readFields, this needs no lineage parameter: writeField
+// unconditionally unmaps DBaseBinary/DBaseGeneral back to their
+// on-disk B/G bytes, which is a no-op for every other type. Those
+// two internal values can only exist on a Field in the first
+// place if read-side remapping put them there (or a caller
+// deliberately constructed one), so there is nothing to decide
+// here.
 func writeFields(w io.Writer, fields []Field) error {
 	for _, field := range fields {
 		if err := writeField(w, field); err != nil {
@@ -39,7 +51,9 @@ func writeFields(w io.Writer, fields []Field) error {
 // readField reads a single 32-byte field descriptor.
 //
 // If the header terminator (0x0D) is encountered, done is returned as true.
-func readField(r io.Reader) (field Field, done bool, err error) {
+//
+// lineageIsDBase — see readFields.
+func readField(r io.Reader, lineageIsDBase bool) (field Field, done bool, err error) {
 	var raw [fieldDescriptorSize]byte
 
 	if _, err = io.ReadFull(r, raw[:1]); err != nil {
@@ -57,9 +71,18 @@ func readField(r io.Reader) (field Field, done bool, err error) {
 
 	field = Field{
 		Name:     decodeFieldName(raw[:MaxFieldNameLength]),
-		Type:     FieldType(raw[11]),
+		Type:     remapDBaseLineageType(FieldType(raw[11]), lineageIsDBase),
 		Length:   raw[16],
 		Decimals: raw[17],
+
+		// Byte 18: 0x01 system, 0x02 nullable, 0x04 binary
+		// (CHAR/MEMO only). Meaningless outside the VFP lineage,
+		// where this byte is reserved for LAN use — but reading
+		// it unconditionally is harmless there, since dBASE
+		// III+/Clipper writers zero it.
+		SystemColumn: raw[18]&0x01 != 0,
+		Nullable:     raw[18]&0x02 != 0,
+		Binary:       raw[18]&0x04 != 0,
 	}
 
 	if !isSupportedType(field.Type) {
@@ -80,7 +103,7 @@ func writeField(w io.Writer, field Field) error {
 
 	encodeFieldName(raw[:MaxFieldNameLength], field.Name)
 
-	raw[11] = byte(field.Type)
+	raw[11] = byte(unmapDBaseLineageType(field.Type))
 
 	// Bytes 12..15 contain the field data address.
 	//

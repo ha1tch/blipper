@@ -109,8 +109,11 @@ func zeroValue(f Field) any {
 	case Date:
 		return time.Time{}
 
-	case Memo:
+	case Memo, DBaseBinary, DBaseGeneral:
 		return ""
+
+	case System:
+		return make([]byte, f.Length)
 
 	default:
 		return nil
@@ -155,11 +158,22 @@ func validValue(field Field, value any) bool {
 		_, ok := value.(time.Time)
 		return ok
 
-	case Memo:
+	case Memo, Varchar, DBaseBinary, DBaseGeneral:
 		_, ok := value.(string)
 		return ok
 
+	case Varbinary:
+		_, ok := value.([]byte)
+		return ok
+
+	case System:
+		_, ok := value.([]byte)
+		return ok
+
 	default:
+		if isVFPType(field.Type) {
+			return validVFPValue(field.Type, value)
+		}
 		return false
 	}
 }

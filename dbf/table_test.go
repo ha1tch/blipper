@@ -363,8 +363,11 @@ func TestFlushStampsDate(t *testing.T) {
 
 	now := time.Now()
 
-	if file.data[1] != byte(now.Year()-1900) {
-		t.Errorf("year byte = %d, want %d", file.data[1], now.Year()-1900)
+	// T-08: header year is mod-100 (Clipper 5.2e convention),
+	// verified byte-for-byte against a Clipper-generated file
+	// under guard G-01.
+	if file.data[1] != byte(now.Year()%100) {
+		t.Errorf("year byte = %d, want %d (mod-100)", file.data[1], now.Year()%100)
 	}
 	if file.data[2] != byte(now.Month()) {
 		t.Errorf("month byte = %d, want %d", file.data[2], now.Month())

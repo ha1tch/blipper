@@ -23,6 +23,8 @@ func TestHeaderRoundTrip(t *testing.T) {
 		schema.HeaderSize(),
 		schema.RecordSize(),
 		7,
+		dbfVersion,
+		0,
 	)
 	if err != nil {
 		t.Fatalf("writeHeader: %v", err)
@@ -63,7 +65,7 @@ func TestHeaderStructuralOffsets(t *testing.T) {
 
 	var buf bytes.Buffer
 
-	if err := writeHeader(&buf, header, 225, 51, 260); err != nil {
+	if err := writeHeader(&buf, header, 225, 51, 260, dbfVersion, 0); err != nil {
 		t.Fatalf("writeHeader: %v", err)
 	}
 
@@ -91,7 +93,7 @@ func TestHeaderStructuralOffsets(t *testing.T) {
 
 func TestHeaderRejectsUnknownVersion(t *testing.T) {
 	raw := make([]byte, fileHeaderSize)
-	raw[0] = 0x8B // dBASE IV with memo
+	raw[0] = 0x02 // dBASE II — a different format entirely, never supported
 
 	if _, _, err := readHeader(bytes.NewReader(raw)); err == nil {
 		t.Fatalf("expected version error")
@@ -112,7 +114,7 @@ func TestFieldsRoundTrip(t *testing.T) {
 		t.Fatalf("descriptors are %d bytes, want %d", buf.Len(), want)
 	}
 
-	fields, err := readFields(&buf)
+	fields, err := readFields(&buf, false)
 	if err != nil {
 		t.Fatalf("readFields: %v", err)
 	}

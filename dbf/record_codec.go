@@ -97,10 +97,35 @@ func decodeRecord(src []byte, schema Schema) (Record, error) {
 
 	pos := 1
 
+	// T-36: locate _NullFlags's raw bytes once, up front, so
+	// Varchar/Varbinary fields below can decode exactly rather
+	// than approximating. Computed from field-offset arithmetic
+	// rather than requiring _NullFlags to be the last field,
+	// even though every source and specimen found this session
+	// places it there.
+	var nullFlagsRaw []byte
+	if sysIdx, ok := nullFlagsFieldIndex(schema); ok {
+		sysOffset := 1
+		for i := 0; i < sysIdx; i++ {
+			sysOffset += int(schema.Fields[i].Length)
+		}
+		sysLen := int(schema.Fields[sysIdx].Length)
+		nullFlagsRaw = src[sysOffset : sysOffset+sysLen]
+	}
+
 	for i, field := range schema.Fields {
 		raw := src[pos : pos+int(field.Length)]
 
-		value, err := decodeValue(raw, field)
+		var (
+			value any
+			err   error
+		)
+
+		if nullFlagsRaw != nil && (field.Type == Varchar || field.Type == Varbinary) {
+			value, err = decodeVarLenExact(raw, field, schema, i, nullFlagsRaw)
+		} else {
+			value, err = decodeValue(raw, field)
+		}
 		if err != nil {
 			return Record{}, fmt.Errorf("field %q: %w", field.Name, err)
 		}
@@ -112,15 +137,100 @@ func decodeRecord(src []byte, schema Schema) (Record, error) {
 	return record, nil
 }
 
+// decodeVarLenExact decodes a Varchar/Varbinary field's exact
+// content using the field's "full" bit, rather than the
+// space-trim approximation decodeValue falls back to when this
+// information isn't available (T-36).
+//
+// When the field is full (bit clear), content occupies the entire
+// width — this is exactly what the approximation already got
+// right, so both paths agree. When not full (bit set), the exact
+// length lives in the field's own last byte (S7, S10,
+// docs/VFP30_FORMAT.md), and everything before that is real
+// content, including any significant trailing spaces the
+// space-trim approximation would have discarded.
+func decodeVarLenExact(raw []byte, field Field, schema Schema, fieldIndex int, nullFlagsRaw []byte) (any, error) {
+	bit, err := fullBitPosition(schema, fieldIndex)
+	if err != nil {
+		// Not actually a Varchar/Varbinary field by schema's own
+		// accounting — fall back to the approximation rather
+		// than fail a decode over an internal inconsistency.
+		return decodeValue(raw, field)
+	}
+
+	full := !bitSet(nullFlagsRaw, bit)
+	if full {
+		return decodeValue(raw, field)
+	}
+
+	if len(raw) == 0 {
+		return decodeValue(raw, field)
+	}
+	actualLen := int(raw[len(raw)-1])
+	if actualLen < 0 || actualLen > len(raw)-1 {
+		// A length byte outside the plausible range for this
+		// field's width is a malformed record, not something to
+		// guess at — fall back rather than slice out of range.
+		return decodeValue(raw, field)
+	}
+
+	content := raw[:actualLen]
+	if field.Type == Varbinary {
+		out := make([]byte, actualLen)
+		copy(out, content)
+		return out, nil
+	}
+	return string(content), nil
+}
+
 func encodeValue(dst []byte, field Field, value any) error {
+	if field.Type == System {
+		b, ok := value.([]byte)
+		if !ok {
+			return fmt.Errorf("expected []byte for the System field, got %T", value)
+		}
+		if len(b) != len(dst) {
+			return fmt.Errorf("System field is %d bytes, got %d", len(dst), len(b))
+		}
+		copy(dst, b)
+		return nil
+	}
+	// The VFP binary types are fixed-width and little-endian,
+	// nothing like the ASCII types below, so they are handled
+	// first and fall through when the type is not one of theirs.
+	if handled, err := encodeVFPValue(dst, field, value); handled {
+		return err
+	}
+
 	switch field.Type {
 
-	case Character, Memo:
+	case Character, Memo, Varchar, DBaseBinary, DBaseGeneral:
 		s, ok := stringValue(value)
 		if !ok {
 			return fmt.Errorf("expected string, got %T", value)
 		}
 		encodePadded(dst, s)
+		return nil
+
+	case Varbinary:
+		// Written as always-full: content occupies the entire
+		// field with no length byte or truncation tracking. The
+		// caller's corresponding _NullFlags "full" bit (if the
+		// field is also nullable, or standalone if not — see
+		// dbf/nullflags.go) must be 0 for this to be self
+		// consistent, which the safe subset supported here
+		// guarantees by never writing a truncated value.
+		b, ok := value.([]byte)
+		if !ok {
+			return fmt.Errorf("expected []byte for a Varbinary field, got %T", value)
+		}
+		if len(b) > len(dst) {
+			return fmt.Errorf("Varbinary value is %d bytes, field is %d", len(b), len(dst))
+		}
+		for i := range dst {
+			dst[i] = ' '
+		}
+		copy(dst, b)
 		return nil
 
 	case Numeric, Float:
@@ -151,10 +261,44 @@ func encodeValue(dst []byte, field Field, value any) error {
 }
 
 func decodeValue(raw []byte, field Field) (any, error) {
+	if field.Type == System {
+		// The hidden _NullFlags field: opaque to the normal type
+		// system, read via Record.IsNull rather than Get. Copied
+		// rather than aliased, since raw is a slice into the
+		// caller's record buffer.
+		out := make([]byte, len(raw))
+		copy(out, raw)
+		return out, nil
+	}
+	if v, handled, err := decodeVFPValue(raw, field); handled {
+		return v, err
+	}
+
 	switch field.Type {
 
-	case Character, Memo:
+	case Character, Memo, Varchar:
+		// Varchar decoded as an approximation: space-trimmed like
+		// Character, correct whenever the field is full and for
+		// the common not-full case, but not exact if the stored
+		// value legitimately ends in significant spaces — see
+		// the type's doc comment in dbf/vfptypes.go.
 		return strings.TrimRight(string(raw), " "), nil
+
+	case DBaseBinary, DBaseGeneral:
+		// Same 10-digit ASCII .DBT pointer convention as Memo —
+		// see dbf/dbasetypes.go. Reusing Memo's plain trim is
+		// exact here, not an approximation: dBASE's own B/G/M
+		// all share this one encoding, unlike Varchar/Varbinary's
+		// separate not-full mechanism.
+		return strings.TrimRight(string(raw), " "), nil
+
+	case Varbinary:
+		// Same approximation as Varchar, applied to bytes rather
+		// than a string, since S10's worked example confirms
+		// Varbinary pads with spaces on disk exactly like
+		// Varchar — not NUL, correcting what v0.9.15 had wrong.
+		trimmed := []byte(strings.TrimRight(string(raw), " "))
+		return trimmed, nil
 
 	case Numeric, Float:
 		return decodeNumeric(raw, field)
@@ -197,43 +341,52 @@ func encodePadded(dst []byte, s string) {
 }
 
 func encodeNumeric(dst []byte, field Field, value any) error {
-	var text string
+	if value == nil {
+		for i := range dst {
+			dst[i] = ' '
+		}
+		return nil
+	}
 
-	switch {
-	case value == nil:
-		text = ""
-
-	case field.Type == Numeric && field.Decimals == 0:
+	// An integer field is rendered from an integer to avoid float
+	// rounding on values beyond 2^53.
+	if field.Type == Numeric && field.Decimals == 0 {
 		i, ok := intValue(value)
 		if !ok {
 			return fmt.Errorf("expected integer value, got %T", value)
 		}
-		text = strconv.FormatInt(i, 10)
 
-	default:
-		f, ok := floatValue(value)
-		if !ok {
-			return fmt.Errorf("expected numeric value, got %T", value)
+		text := strconv.FormatInt(i, 10)
+
+		if len(text) > len(dst) {
+			return fmt.Errorf(
+				"%w: value %s does not fit in %d byte field",
+				ErrNumericOverflow, text, len(dst),
+			)
 		}
-		text = strconv.FormatFloat(f, 'f', int(field.Decimals), 64)
+
+		pad := len(dst) - len(text)
+
+		for j := 0; j < pad; j++ {
+			dst[j] = ' '
+		}
+
+		copy(dst[pad:], text)
+
+		return nil
 	}
 
-	if len(text) > len(dst) {
-		return fmt.Errorf(
-			"value %s does not fit in %d byte field",
-			text,
-			len(dst),
-		)
+	f, ok := floatValue(value)
+	if !ok {
+		return fmt.Errorf("expected numeric value, got %T", value)
 	}
 
-	// Right aligned, space padded.
-	pad := len(dst) - len(text)
-
-	for i := 0; i < pad; i++ {
-		dst[i] = ' '
+	out, err := FormatNumeric(f, len(dst), int(field.Decimals), PadSpace)
+	if err != nil {
+		return err
 	}
 
-	copy(dst[pad:], text)
+	copy(dst, out)
 
 	return nil
 }

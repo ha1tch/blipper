@@ -18,6 +18,37 @@ func (t *Table) Header() Header {
 	return t.header
 }
 
+// MemoFormat reports which memo file format the table expects, if
+// any. Callers use this to decide which sibling to open and with
+// which constructor: OpenMemo for .DBT (dBASE III+ layout),
+// OpenDBaseIVMemo for .DBT (dBASE IV/5.0 layout — same extension,
+// different physical format), or OpenFPT for .FPT.
+//
+// The value is derived from the on-disk version byte and preserved
+// through header rewrites:
+//
+//	0x03 → MemoFormatNone (dBASE III+ without memo)
+//	0x83 → MemoFormatDBT  (dBASE III+ with .DBT)
+//	0xF5 → MemoFormatFPT  (FoxPro-format with .FPT)
+//	0x8B → MemoFormatDBaseIV (dBASE IV/5.0 with .DBT, 8-byte block header)
+//
+// A schema with a Memo field but a version byte of 0x03 is
+// possible only through hand-editing and is not distinguished
+// here; callers who need that check can compare Schema.HasMemo
+// against MemoFormat.
+func (t *Table) MemoFormat() MemoFormat {
+	switch t.versionByte {
+	case dbfVersionFPT:
+		return MemoFormatFPT
+	case dbfVersionMemo:
+		return MemoFormatDBT
+	case dbfVersionDBaseIV:
+		return MemoFormatDBaseIV
+	default:
+		return MemoFormatNone
+	}
+}
+
 // RecordCount returns the number of records in the table, including
 // records marked as deleted.
 func (t *Table) RecordCount() uint32 {
@@ -45,6 +76,11 @@ func (t *Table) Get(recno uint32) (Record, error) {
 		return Record{}, fmt.Errorf("record %d: %w", recno, err)
 	}
 
+	// Text fields arrive as raw bytes; convert them from the
+	// file's declared code page. The identity codec, which is
+	// what a file declaring nothing gets, leaves them alone.
+	t.codec.applyDecode(&record, t.schema)
+
 	return record, nil
 }
 
@@ -56,7 +92,11 @@ func (t *Table) Put(recno uint32, record Record) error {
 
 	raw := make([]byte, t.schema.RecordSize())
 
-	if err := encodeRecord(raw, t.schema, record); err != nil {
+	encoded, err := t.codec.applyEncode(record, t.schema)
+	if err != nil {
+		return fmt.Errorf("record %d: %w", recno, err)
+	}
+	if err := encodeRecord(raw, t.schema, encoded); err != nil {
 		return fmt.Errorf("record %d: %w", recno, err)
 	}
 
@@ -76,7 +116,11 @@ func (t *Table) Put(recno uint32, record Record) error {
 func (t *Table) Append(record Record) (uint32, error) {
 	raw := make([]byte, t.schema.RecordSize())
 
-	if err := encodeRecord(raw, t.schema, record); err != nil {
+	encoded, err := t.codec.applyEncode(record, t.schema)
+	if err != nil {
+		return 0, err
+	}
+	if err := encodeRecord(raw, t.schema, encoded); err != nil {
 		return 0, err
 	}
 
@@ -141,6 +185,56 @@ func (t *Table) setDeletionMarker(recno uint32, marker byte) error {
 	return t.flushHeader()
 }
 
+// Reload re-reads the table's header from the underlying stream,
+// picking up changes another process may have made — most
+// commonly RecordCount, when another process appended records
+// since this Table was opened or last reloaded.
+//
+// T-20: blipper has no automatic cache invalidation for a shared
+// reader. Before this, no reload path existed at all — a shared
+// reader's Table.RecordCount() simply never changed once Open
+// returned, regardless of what any other process wrote. A caller
+// sharing a table across processes must call Reload explicitly
+// to observe writes made elsewhere; there is no notification
+// mechanism, and none is planned — that would be a different,
+// larger feature.
+//
+// Deliberately narrow: only RecordCount and the header's
+// LastUpdate are refreshed. Schema and physical layout (header
+// size, record size, version byte, table flags) are not re-read.
+// Those cannot legitimately change without a structural migration
+// this package does not support performing concurrently, and
+// re-reading them here would risk silently accepting a
+// half-written state as if it were a normal schema change. A
+// record-size mismatch is reported as an error rather than
+// applied, since it means the file is no longer the table this
+// Table was opened against, not that a write is in progress.
+//
+// This is the one part of T-20 in scope here — cdx, dbc, and
+// fatfs each cache their own state independently and need their
+// own reload design; see docs/TRACKING.md.
+func (t *Table) Reload() error {
+	if _, err := t.rw.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("dbf: reload: %w", err)
+	}
+
+	header, info, err := readHeader(t.rw)
+	if err != nil {
+		return fmt.Errorf("dbf: reload: %w", err)
+	}
+	if info.recordSize != t.schema.RecordSize() {
+		return fmt.Errorf(
+			"dbf: reload: record size is now %d, was %d — this is a different table, not a concurrent write",
+			info.recordSize, t.schema.RecordSize(),
+		)
+	}
+
+	t.recordCount = info.recordCount
+	t.header.LastUpdate = header.LastUpdate
+
+	return nil
+}
+
 func (t *Table) checkRecno(recno uint32) error {
 	if recno == 0 {
 		return fmt.Errorf("record numbers are one-based")
@@ -172,5 +266,32 @@ func (t *Table) flushHeader() error {
 		uint16(t.recordStart),
 		t.schema.RecordSize(),
 		t.recordCount,
+		t.versionByte,
+		t.tableFlags,
 	)
 }
+
+// TableFlags returns byte 28 of the on-disk header, verbatim,
+// with no interpretation applied — its meaning depends entirely
+// on lineage (see isDBaseLineage, dbf/header.go), and blipper
+// deliberately does not decide that for the caller here.
+//
+// For VFP tables (see T-10's truth table): bit 2 (0x04) means
+// DBC-owned; bit 3 (0x08) means blipper-written; combined 0x0C is
+// the pair blipper writes for its own DBC-owned tables.
+//
+// For dBASE IV/5.0 tables (T-31): bit 0 (0x01) means a production
+// `.MDX` accompanies the table — confirmed against both the
+// original 1994 vendor specimens and a live 2026 write-oracle
+// (source S13). Field-descriptor byte 31, documented everywhere
+// as the per-field counterpart to this flag, does not reliably
+// track current tag membership — see dbf/nullflags.go's neighbour
+// and docs/DBASE_FORMAT.md's dBASE IV section. Determine tag
+// membership from the sibling .MDX's own tag directory, never
+// from either byte.
+func (t *Table) TableFlags() byte { return t.tableFlags }
+
+// Backlink returns the relative path to the sibling .DBC parsed
+// from the VFP-format backlink region. Empty when byte 28 bit 2
+// is not set.
+func (t *Table) Backlink() string { return t.backlink }

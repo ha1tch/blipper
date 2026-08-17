@@ -2,7 +2,7 @@ package ntx
 
 import (
 	"fmt"
-	"strconv"
+	"math"
 	"time"
 
 	"github.com/ha1tch/blipper/dbf"
@@ -46,46 +46,35 @@ func LogicalKey(b bool) []byte {
 	return []byte("F")
 }
 
-// NumericKey encodes a non-negative number the way Clipper's Str()
-// does: right aligned in a field of the given length with the given
-// decimal count, space padded. For non-negative values this collates
-// numerically under byte comparison.
+// NumericKey encodes a number the way Clipper does for an NTX index
+// key: the absolute value rendered right aligned and ZERO padded in a
+// field of the given length with the given decimal count.
 //
-// Negative values are rejected: Clipper applies a byte transform to
-// negative numeric keys so they collate below positives, and this
-// package does not guess at that encoding until it has been verified
-// against real Clipper output (tracked as register item T-01).
+// Negative values additionally receive Clipper's digit transform,
+// out = 0x5C - in, applied to every byte except the decimal point.
+// Because ',' (0x2C) < '.' (0x2E) < '0' (0x30), this makes every
+// negative key sort below every positive one under plain byte
+// comparison, and within negatives a larger magnitude sorts first.
+//
+// Note that keys are zero padded, not space padded as a DBF record
+// field is: a leading space would collate below every digit and
+// corrupt the ordering. Verified against Clipper 5.2e output; see
+// docs/CLIPPER_ORACLE.md §9.
 func NumericKey(value float64, length, decimals int) ([]byte, error) {
-	if value < 0 {
-		return nil, fmt.Errorf(
-			"%w: negative numeric keys (see register item T-01)",
-			dbf.ErrUnsupported,
-		)
-	}
-
 	if length <= 0 || length > MaxKeySize {
 		return nil, fmt.Errorf("bad numeric key length %d", length)
 	}
 
-	text := strconv.FormatFloat(value, 'f', decimals, 64)
+	negative := math.Signbit(value) && value != 0
 
-	if len(text) > length {
-		return nil, fmt.Errorf(
-			"value %s does not fit a %d byte key",
-			text,
-			length,
-		)
+	key, err := dbf.FormatNumeric(math.Abs(value), length, decimals, dbf.PadZero)
+	if err != nil {
+		return nil, err
 	}
 
-	key := make([]byte, length)
-
-	pad := length - len(text)
-
-	for i := 0; i < pad; i++ {
-		key[i] = ' '
+	if negative {
+		key = dbf.ApplyNegativeKeyTransform(key)
 	}
-
-	copy(key[pad:], text)
 
 	return key, nil
 }
