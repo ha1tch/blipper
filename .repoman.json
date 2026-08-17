@@ -4,17 +4,13 @@
   "resolved": "docs/RESOLVED.md",
   "known_issues": "docs/KNOWN_ISSUES.md",
   "changelog": "CHANGELOG.md",
-  "version_file": "VERSION",
-  "version_targets": [
-    {
+  "version_file": "VERSION",  "version_targets": [ {
       "file": "docs/TRACKING.md",
       "match": "^Version: (\\S+)$"
-    },
-    {
+    }, {
       "file": "docs/KNOWN_ISSUES.md",
       "match": "^Version: (\\S+)$"
-    },
-    {
+    }, {
       "file": "docs/CLIPPER_ORACLE.md",
       "match": "^Version: (\\S+)$"
     }
